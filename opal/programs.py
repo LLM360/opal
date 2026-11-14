@@ -18,6 +18,8 @@ from pathlib import Path
 import torch
 import numpy as np
 
+from .misc.sharding import DTensor
+
 PROGRAM_FILES = ("updater.py", "analysis.py")
 DATA_FILES = ()  # files besides modules that count as program files (the updater side): none since knobs mode went
 _MODULE_FILE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\.py")
@@ -239,6 +241,12 @@ def unpicklable(obj) -> list:
             torch.Size, torch.dtype, torch.device, torch.layout, torch.memory_format,
         )):
             return
+        if DTensor is not None and kind is DTensor:
+            # sharded parameters (FSDP2): torch.load(weights_only=True) rebuilds DTensors; check the shard it holds
+            # and its Python attributes like a plain tensor's
+            plain(value._local_tensor, depth + 1)
+            plain(vars(value), depth + 1)
+            return
         if not any(kind is allowed for allowed in (
             torch.Tensor, torch.nn.Parameter, dict, Counter, OrderedDict, list, tuple, set, frozenset,
         )):
@@ -435,8 +443,11 @@ def analyze(obs, memory):
     names = [n for n, g in obs.grads.items() if g is not None]
     if not names:
         return None
-    gn = torch.stack(torch._foreach_norm([obs.grads[n].float() for n in names])).tolist()
-    wn = torch.stack(torch._foreach_norm([obs.params[n].detach().float() for n in names])).tolist()
+    gn = torch.stack(torch._foreach_norm([obs.grads[n].float() for n in names]))
+    wn = torch.stack(torch._foreach_norm([obs.params[n].detach().float() for n in names]))
+    # sharded parameters (DTensors): reduce to full tensors before reading values on the host
+    gn = (gn.full_tensor() if hasattr(gn, "full_tensor") else gn).tolist()
+    wn = (wn.full_tensor() if hasattr(wn, "full_tensor") else wn).tolist()
     roles, blocks = {{}}, {{}}
     for n, g, w in zip(names, gn, wn):
         r = roles.setdefault(_role(n), [0.0, 0.0])

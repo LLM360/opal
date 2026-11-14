@@ -20,8 +20,9 @@ Keep test data and labels out of the training process, evaluate the final checkp
    (single GPU, DDP, Accelerate, HF Trainer, Lightning, FSDP/DeepSpeed), gradient clipping in the loop, GradScaler,
    gradient accumulation, EMA, checkpoint save/load, and whether parameter groups are added during training (for
    example layers unfrozen later).
-2. **Check it is supported.** FSDP, ZeRO/DeepSpeed, tensor or pipeline parallelism and JAX are not supported: stop
-   and tell the user. With an HF Trainer, use `opal.hf.OpalTrainer` (docs/GUIDE.md, "Hugging Face Trainer").
+2. **Check it is supported.** FSDP1 (`FullyShardedDataParallel`), ZeRO/DeepSpeed, tensor or pipeline parallelism
+   and JAX are not supported: stop and tell the user. FSDP2 (`fully_shard`) and HSDP are supported: wrap after
+   `fully_shard` and follow docs/GUIDE.md, "Sharded parameters (FSDP2)", for checkpoints and blocking. With an HF Trainer, use `opal.hf.OpalTrainer` (docs/GUIDE.md, "Hugging Face Trainer").
    With Accelerate, wrap after `accelerator.prepare` (GUIDE, "Accelerate"). Lightning is untested: say so before
    continuing. All parameter groups must exist before `wrap`: for layers unfrozen later, create their group up front
    with `requires_grad=False` and set it to True when they are unfrozen. With DDP, every rank must run the same number

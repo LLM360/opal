@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased (LLM360 fork)
+
+- Sharded parameters: FSDP2 (`fully_shard`) and HSDP runs, on one node or several. Until now a DTensor parameter
+  crashed the rank check, and with pure sharding the rank-0-only analysis hung training.
+  - OPAL detects DTensor parameters. It runs `analysis.py` on every rank, on rank 0's inputs. The rank check compares
+    each shard only with its replicas. Snapshots, undo and skips use local shards. The agent gets a section on
+    sharded parameters and the placement of each tensor.
+  - FSDP1 is refused with a message.
+  - Runs without DTensors are unchanged. The starting analysis programs gain a helper that reads DTensor values, and
+    their results are the same.
+  - See [Sharded parameters](docs/GUIDE.md#sharded-parameters-fsdp2).
+
 ## 0.3.10 (2026-10-30)
 
 - "Development set" is now "validation set" everywhere, including the text the agent reads: the TASK sentences of the

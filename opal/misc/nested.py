@@ -6,8 +6,12 @@ import copy
 
 import torch
 
+from .sharding import ShardCopy, is_dtensor
+
 
 def devices(obj):
+    if isinstance(obj, ShardCopy):
+        return obj.local.device.type
     if torch.is_tensor(obj):
         return obj.device.type
     if isinstance(obj, dict):
@@ -20,7 +24,10 @@ def devices(obj):
 def restore_devices(obj, dev, default, key=None):
     """Checkpoints are often loaded with map_location='cpu', and in DDP every rank loads rank 0's file. Put each
     tensor of the updater state back on this rank's device if it was on an accelerator, or on the CPU if it was
-    there. Old checkpoints without device records: everything to the device except torch optimizers' step counters."""
+    there. Old checkpoints without device records: everything to the device except torch optimizers' step counters.
+    A ShardCopy (a DTensor's local shard copied by to_cpu) becomes the DTensor again, on this rank's device."""
+    if isinstance(obj, ShardCopy):
+        return obj.rebuild(default)
     if torch.is_tensor(obj):
         if isinstance(dev, str):
             return obj.to("cpu") if dev == "cpu" else obj.to(default)
@@ -41,7 +48,11 @@ def restore_devices(obj, dev, default, key=None):
 def nbytes(obj, seen=None):
     """Bytes of the distinct tensors in a nested structure (a tensor reachable twice counts once)."""
     seen = set() if seen is None else seen
+    if isinstance(obj, ShardCopy):
+        return obj.nbytes()
     if torch.is_tensor(obj):
+        if is_dtensor(obj):
+            obj = obj.to_local()
         if id(obj) in seen:
             return 0
         seen.add(id(obj))
@@ -54,11 +65,12 @@ def nbytes(obj, seen=None):
 
 
 def to_cpu(obj, memo=None):
-    """CPU copy of a nested structure; a tensor reachable twice is copied once."""
+    """CPU copy of a nested structure; a tensor reachable twice is copied once. A DTensor is copied as its local
+    shard (a ShardCopy), which restore_devices turns back into the DTensor."""
     memo = {} if memo is None else memo
     if torch.is_tensor(obj):
         if id(obj) not in memo:
-            memo[id(obj)] = obj.detach().to("cpu", copy=True)
+            memo[id(obj)] = ShardCopy(obj) if is_dtensor(obj) else obj.detach().to("cpu", copy=True)
         return memo[id(obj)]
     if isinstance(obj, dict):
         return {k: to_cpu(v, memo) for k, v in obj.items()}

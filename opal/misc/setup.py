@@ -250,4 +250,55 @@ class SetupMixin:
                 " Your programs reach the user's optimizer and scheduler objects through spec (below)."
             ),
         )
-        return fill_template(template, fields)
+        text = fill_template(template, fields)
+        if getattr(self, "sharded", False):
+            text = with_sharding_section(text, self._shard_replicas)
+        return text
+
+
+SHARDED_SECTION = """SHARDED PARAMETERS (THIS RUN)
+This run shards its parameters (FSDP2): every parameter and gradient, and every optimizer state tensor shaped like a
+parameter, is a torch.distributed.tensor.DTensor. Each rank stores only its local shard (p.to_local()); the parameter
+table gives each tensor's mesh placements and rank 0's local shape. Where the text above says otherwise, this applies:
+- analysis.py runs on every rank, not only on rank 0, with the same inputs on every rank (rank 0's losses, metrics and
+  timings); rank 0's report and wake request are kept. Every rank must take the same branches and make the same calls
+  in the same order: a reduction of a DTensor (norm, sum, max, dot) is a collective that waits for every rank. Read a
+  value on the host only after reducing it to a full tensor (torch.linalg.vector_norm(g).full_tensor().item());
+  .item(), .tolist() and float() raise on a DTensor, and a DTensor in a report is stored as text. An exception raised
+  on some ranks only, before a collective, stalls training until the communication timeout.
+- updater.py still runs on every rank with the same code, but "no communication between ranks" is replaced by:
+  communicate only through DTensor operations that every rank runs in the same order. Elementwise math between
+  tensors placed alike (p, its gradient, state made with torch.zeros_like(p)) is local and needs no communication; for
+  many tensors at once, apply torch._foreach_* to the local shards (x.to_local()). A reduction returns a DTensor with a
+  Partial placement, and reading it or combining it with a differently placed tensor communicates (one small
+  all-reduce for a global gradient norm is fine).
+- A rule that needs the whole matrix (Muon's Newton-Schulz iteration, Shampoo or SOAP preconditioners, statistics
+  along a sharded dimension) must gather it: x.full_tensor() materialises the full matrix on every rank, costing an
+  all-gather per matrix per update and its full size in memory, and on a large model it may not fit. Applying such a
+  rule to each local shard instead is a different rule; if you do, say so in your rationale. Work along a dimension
+  that is not sharded is local.
+- Change parameters in place, as torch.optim does (p.mul_, p.add_, p.copy_, torch._foreach_add_ on local shards); do
+  not assign p.data or replace a parameter. Never call full_tensor() on a parameter-shaped tensor just to do
+  elementwise work.
+- Create parameter-shaped state with torch.zeros_like(p) or p.detach().clone() (sharded like p); state built from a
+  full tensor costs its full size on every rank. state_dict() may hold DTensors; each rank checkpoints its own shards.
+- {replicas}
+"""
+
+REPLICAS = (
+    "The rank check compares each shard with its replicas (the ranks of other replica groups that hold the same\n"
+    "  shard): an updater that makes replicas differ fails its trial."
+)
+NO_REPLICAS = (
+    "Each shard is held by one rank only (no replicas), so nothing checks that your updater acts identically on every\n"
+    "  rank: make sure it does (no rank-dependent randomness or branches)."
+)
+
+
+def with_sharding_section(text, replicas):
+    """The prompt with the sharded-parameters section before INTERFACES (at the end for templates without one)."""
+    section = SHARDED_SECTION.format(replicas=REPLICAS if replicas else NO_REPLICAS)
+    at = text.find("\nINTERFACES\n")
+    if at < 0:
+        return text.rstrip("\n") + "\n\n" + section
+    return text[: at + 1] + section + "\n" + text[at + 1 :]

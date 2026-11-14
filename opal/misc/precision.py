@@ -16,6 +16,7 @@ import contextlib
 import torch
 
 from .. import programs
+from .sharding import is_dtensor
 
 
 class PrecisionMixin:
@@ -154,22 +155,25 @@ class PrecisionMixin:
     def _analysis_marks(self):
         """What analyze() may not change: each parameter's and gradient's version counter (bumped by any in-place
         change), the gradient object, dtypes and devices."""
-        return [
-            (p._version, p.dtype, p.device, id(p.grad), None if p.grad is None else (p.grad._version, p.grad.dtype))
-            for _, p in self.named
-        ]
+        return [self._mark(p) for _, p in self.named]
+
+    @staticmethod
+    def _mark(p):
+        # a DTensor's own version counter misses in-place changes made through its local shard: record both
+        g = p.grad
+        return (
+            p._version,
+            _local_version(p),
+            p.dtype,
+            p.device,
+            id(g),
+            None if g is None else (g._version, _local_version(g), g.dtype),
+        )
 
     def _analysis_changes(self, marks):
         out = []
         for (n, p), m in zip(self.named, marks):
-            now = (
-                p._version,
-                p.dtype,
-                p.device,
-                id(p.grad),
-                None if p.grad is None else (p.grad._version, p.grad.dtype),
-            )
-            if now != m:
+            if self._mark(p) != m:
                 out.append(n)
         return out
 
@@ -208,3 +212,7 @@ def _walk_state(obj, path, by_name, by_shape, skip, out, owner):
     elif isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
             _walk_state(v, f"{path}[{i}]", by_name, by_shape, skip, out, owner)
+
+
+def _local_version(t):
+    return t._local_tensor._version if is_dtensor(t) else None

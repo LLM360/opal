@@ -19,8 +19,13 @@ import torch
 
 from .. import programs
 from .nested import devices, nbytes, restore_devices, to_cpu
+from .sharding import ShardCopy, copy_into
 from .schedulers import follows
 from .skip import takes_ctx
+
+
+def _dtype_of(copy_):
+    return copy_.local.dtype if isinstance(copy_, ShardCopy) else copy_.dtype
 
 
 class RecoveryMixin:
@@ -96,18 +101,12 @@ class RecoveryMixin:
         taken)."""
         c = snap["copies"]
         for (_, p), w, d, dev in zip(self.named, c["params"], self._dtypes, self._devices):
-            if p.dtype is not d or p.device != dev or p.shape != w.shape:
-                p.data = w.to(dev, d)
-            else:
-                p.data.copy_(w)
+            copy_into(p, w, dev, d)  # in place where possible: FSDP2 keeps reading the shard's storage
         for (_, p), g, w, dev in zip(self.named, snap["grads"], c["grads"], self._devices):
             if g is None:
                 p.grad = None
                 continue
-            if g.dtype is not w.dtype or g.shape != w.shape or g.device != dev:
-                g.data = w.to(dev)
-            else:
-                g.copy_(w)
+            copy_into(g, w, dev, _dtype_of(w))
             if p.grad is not g:
                 p.grad = g
         for o, entries, values in zip(self.user_optimizers, snap["opts"], c["opts"]):
@@ -116,14 +115,10 @@ class RecoveryMixin:
                 st.clear()
                 for k, w in vals.items():
                     v, dev = orig[k]
-                    if not torch.is_tensor(w):
+                    if not (torch.is_tensor(w) or isinstance(w, ShardCopy)):
                         st[k] = copy.deepcopy(w)
                         continue
-                    if v.dtype is w.dtype and v.shape == w.shape and v.device == dev:
-                        v.copy_(w)
-                    else:
-                        v.data = w.to(dev)
-                    st[k] = v
+                    st[k] = copy_into(v, w, dev, _dtype_of(w))
                 o.state[p] = st
         if c["old"] is not None and old_updater is not None:
             with programs.keep_param_group_identity():

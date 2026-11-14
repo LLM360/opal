@@ -3,7 +3,7 @@ programs.STARTING_ANALYSIS."""
 
 from __future__ import annotations
 
-TEXT = '''"""Analysis: reports what you want to see at your next decision. Runs on rank 0 only, every EVERY updates,
+TEXT = '''"""Analysis: reports what you want to see at your next decision. Runs on {where}, every EVERY updates,
 after the backward pass and before the update. It never changes the update; the updater computes its own signals.
 
 obs.update, obs.total_updates, obs.losses (loss of each update since the previous call), obs.params and obs.grads
@@ -37,6 +37,17 @@ def _block(name):
 
 def _mean(xs):
     return sum(xs) / len(xs) if xs else None
+
+
+def _host(t):
+    """A tensor whose values can be read on the host: a DTensor (sharded parameters) is reduced to a full tensor first."""
+    return t.full_tensor() if hasattr(t, "full_tensor") else t
+
+
+def _dot(a, b):
+    if hasattr(a, "full_tensor"):  # DTensors: sum of products of matching shards, without gathering either one
+        return (a * b).sum()
+    return torch.dot(a.reshape(-1), b.reshape(-1))
 
 
 def _momentum(updater):
@@ -107,12 +118,12 @@ def analyze(obs, memory):
     ms = [mom.get(obs.params[n_]) if n_ in picked else None for n_ in names]
     have = [i for i, m in enumerate(ms) if m is not None]
     if have:
-        dots = torch.stack([torch.dot(gs[i].reshape(-1), ms[i].float().reshape(-1)) for i in have])
+        dots = torch.stack([_dot(gs[i], ms[i].float()) for i in have])
         mn = torch.stack(torch._foreach_norm([ms[i].float() for i in have]))
     ratio_t = torch.stack(list(ratios.values())) if ratios else None
-    gn, wn = gn.tolist(), wn.tolist()  # host reads, once per call
-    dots, mn = (dots.tolist(), mn.tolist()) if have else ([], [])
-    ratio_v = dict(zip(ratios, ratio_t.tolist())) if ratios else {{}}
+    gn, wn = _host(gn).tolist(), _host(wn).tolist()  # host reads, once per call
+    dots, mn = (_host(dots).tolist(), _host(mn).tolist()) if have else ([], [])
+    ratio_v = dict(zip(ratios, _host(ratio_t).tolist())) if ratios else {{}}
 
     roles = {{}}
     for i, n_ in enumerate(names):
@@ -144,11 +155,12 @@ def analyze(obs, memory):
 '''
 
 
-def text(every, epochs=None) -> str:
+def text(every, epochs=None, sharded=False) -> str:
     doc = (
         ", and the mean loss over the last window minus that over the same updates one epoch earlier" if epochs else ""
     )
-    return TEXT.format(every=every, epochs=repr(epochs if epochs else None), epoch_doc=doc)
+    where = "every rank (the parameters are sharded DTensors; rank 0's report is kept)" if sharded else "rank 0 only"
+    return TEXT.format(every=every, epochs=repr(epochs if epochs else None), epoch_doc=doc, where=where)
 
 
 def note(epochs=None) -> str:

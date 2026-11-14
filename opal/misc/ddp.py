@@ -5,9 +5,13 @@ from __future__ import annotations
 import hashlib
 import sys
 
+import numpy as np
+
 import torch
 import torch.distributed as dist
 from torch.distributed.algorithms.join import JoinHook
+
+from . import sharding
 
 
 UNEVEN_INPUTS_ERROR = (
@@ -43,6 +47,16 @@ def _parameter_chunks(tensor, limit=1_048_576):
         width = max(1, limit // per_slice)
         for start in range(0, tensor.shape[axis], width):
             yield from _parameter_chunks(tensor.narrow(axis, start, min(width, tensor.shape[axis] - start)), limit)
+
+
+def _digest(p):
+    """SHA-256 of the dtype, shape and ordered bytes of the tensor this rank stores (a DTensor's local shard)."""
+    t = sharding.local(p.detach())
+    digest = hashlib.sha256(f"{t.dtype}:{tuple(t.shape)}".encode())
+    for chunk in _parameter_chunks(t):
+        raw = chunk.resolve_conj().resolve_neg().contiguous().view(torch.uint8).cpu().numpy()
+        digest.update(memoryview(raw))
+    return list(digest.digest())
 
 
 class DDPMixin:
@@ -94,19 +108,34 @@ class DDPMixin:
         bytes to CPU in bounded chunks and synchronize device work at check boundaries. Optimizer state is neither
         compared nor broadcast: a sharded optimizer keeps different state on each rank by design.
         """
-        digests = []
-        for _, p in self.named:
-            digest = hashlib.sha256(f"{p.dtype}:{tuple(p.shape)}".encode())
-            for chunk in _parameter_chunks(p.detach()):
-                raw = chunk.resolve_conj().resolve_neg().contiguous().view(torch.uint8).cpu().numpy()
-                digest.update(memoryview(raw))
-            digests.append(list(digest.digest()))
+        if getattr(self, "sharded", False):
+            return self._shard_differences()
+        digests = [_digest(p) for _, p in self.named]
         s = torch.tensor(digests, dtype=torch.uint8)
         lo, hi = s.clone(), s.clone()
         dist.all_reduce(lo, op=dist.ReduceOp.MIN, group=self.ctrl)
         dist.all_reduce(hi, op=dist.ReduceOp.MAX, group=self.ctrl)
         bad = torch.nonzero((lo != hi).any(dim=1)).flatten().tolist()
         return [self.named[i][0] for i in bad]
+
+    def _shard_differences(self):
+        """Sharded parameters: each rank's local shard against the shards of the ranks that hold the same part of the
+        tensor (its replicas). One gloo all-gather of a 16-byte key and a 32-byte digest per tensor; every rank gets
+        the same answer. With pure sharding (no replicas) there is nothing to compare."""
+        if not self._shard_replicas:
+            return []
+        rows = [list(sharding.replica_key(p)) + _digest(p) for _, p in self.named]
+        mine = torch.tensor(rows, dtype=torch.uint8)
+        every = [torch.empty_like(mine) for _ in range(self.world)]
+        dist.all_gather(every, mine, group=self.ctrl)
+        table = torch.stack(every).numpy()  # (world, tensors, 48): key, digest
+        bad = []
+        for i, (name, _) in enumerate(self.named):
+            _, first, group = np.unique(table[:, i, :16], axis=0, return_index=True, return_inverse=True)
+            digests = table[:, i, 16:]
+            if (digests != digests[first[group.reshape(-1)]]).any():  # a rank differs from the first of its replicas
+                bad.append(name)
+        return bad
 
     def _check_ranks(self, u):
         """Reject a fresh updater's drift from a consistent starting point; otherwise repair and flag the run."""
@@ -130,8 +159,13 @@ class DDPMixin:
                 )
             self._recover(u, None, msg, trial=True, rollback=True)
             return names
-        for _, p in self.named:
-            dist.broadcast(p.data, src=0)
+        if getattr(self, "sharded", False):
+            for n, p in self.named:  # the same names on every rank: every replica group joins its broadcasts
+                if n in names:
+                    sharding.broadcast_from_replica(p)
+        else:
+            for _, p in self.named:
+                dist.broadcast(p.data, src=0)
         self._ranks_repaired_at.append(u)
         if self.rank0:
             msg = (

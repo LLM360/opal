@@ -256,6 +256,19 @@ class CheckpointMixin:
                     out.add(f.name.split("-")[1])
         return out
 
+    def _memory_location(self):
+        """Where analysis memory's tensors go on resume: accelerator tensors to this rank's device, CPU ones stay. torch
+        cannot apply a callable map_location to DTensors (sharded runs keep parameter copies there), so those runs map
+        the saved device names instead."""
+        if not getattr(self, "sharded", False):
+            return lambda storage, location: storage if location == "cpu" else storage.to(device=self.device)
+        if self.device.type == "cpu":
+            return None
+        here = str(self.device)
+        names = {self.device.type: here}
+        names.update({f"{self.device.type}:{i}": here for i in range(256)})
+        return names
+
     def load_state_dict(self, state):
         """Resume: call after wrap(...) with the same arguments, on every rank."""
         if state.get("opal") != 1:
@@ -319,8 +332,7 @@ class CheckpointMixin:
                 "the checkpoint has no updater state (it could not be saved); the program restarts its state",
             )
         self.memory = torch.load(
-            io.BytesIO(state["memory"]), weights_only=False,
-            map_location=lambda storage, location: storage if location == "cpu" else storage.to(device=self.device),
+            io.BytesIO(state["memory"]), weights_only=False, map_location=self._memory_location(),
         )
         self._dev = [d for d in state.get("dev", []) if d.get("update", 0) <= self.update]
         if state.get("estimated"):  # the first check of the checkpointed run measured it (and may have capped it)

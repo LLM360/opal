@@ -449,6 +449,49 @@ schedule.
   Call `opt.observe(loss)` once per update and `opt.log(...)` for metrics. Lightning has no test yet.
 - Closure-only optimizers such as LBFGS are not supported as the starting program.
 
+## Sharded parameters (FSDP2)
+
+OPAL works with FSDP2 (`torch.distributed.fsdp.fully_shard`), including HSDP meshes that replicate along one dimension
+and shard along another, on one node or several. Wrap after `fully_shard`, as with DDP:
+
+```python
+for block in model.blocks:
+    fully_shard(block, mesh=mesh)
+fully_shard(model, mesh=mesh)
+opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+opt = opal.wrap(opt, model, scheduler=sched, total_steps=steps, goal="...")
+```
+
+Every parameter is then a DTensor, and each rank holds only its shards. OPAL detects this and changes four things:
+
+- **What the agent is told.** The parameter table lists each tensor's mesh placements and rank 0's local shape. The
+  prompt says which operations communicate. It says that a rule that needs whole matrices (Muon, Shampoo, SOAP) must
+  gather them, at the cost of an all-gather and the full size in memory per matrix per update. It also says that
+  parameters may only be changed in place.
+- **`analysis.py` runs on every rank**, because a norm of a DTensor is a collective. It gets rank 0's losses, metrics
+  and timings, and rank 0's report is kept. An analysis that raises on some ranks only, before a collective, stalls
+  training until the communication timeout.
+- **The rank check compares each shard only with its replicas**, that is, the ranks of other replica groups that hold
+  the same shard. With pure sharding there are no replicas, and nothing checks that an updater acts the same on every
+  rank.
+- **Snapshots, exact undo, skips and the eval-integrity sample use local shards.** The eval-integrity sample is drawn
+  from rank 0's shards.
+
+Checkpoints: `opt.state_dict()` holds this rank's shards of the updater's state as DTensors. Save it on every rank with
+`torch.save`, next to the model's sharded state, and load it into a run with the same world size and mesh.
+`torch.distributed.checkpoint`'s `get_optimizer_state_dict` does not understand OPAL's state.
+
+Not supported:
+
+- FSDP1 (`FullyShardedDataParallel`), whose flat parameters hide the model's names and shapes; `wrap` raises.
+- Tensor parallelism that splits plain tensors by hand: OPAL cannot tell that they are shards.
+- Resuming with another world size.
+
+At a blocking decision every GPU of the job waits, so on a large job consider `blocking=False` or `"auto"`.
+Tested with torch 2.11 on CPU (gloo) and on H200 GPUs (NCCL, bf16 mixed precision), on one node and two.
+`tests/gpu_fsdp.py` checks a run on GPUs: plain against wrapped, an equivalent program swap bit for bit, a fake agent,
+and resuming from a checkpoint.
+
 ## What it costs your training
 
 The wrapper copies loss into a device buffer and reads it every `every` updates, with no host synchronisation per
@@ -585,7 +628,7 @@ Prompt rules describe intended behavior. They do not enforce a security boundary
 
 | Works | Not supported |
 |---|---|
-| Plain PyTorch loops on one GPU or several GPUs of one node (DDP) | Multi-node training (untested), FSDP, ZeRO, DeepSpeed |
+| Plain PyTorch loops on one GPU or several GPUs of one node (DDP); FSDP2 and HSDP on one or several nodes ([Sharded parameters](#sharded-parameters-fsdp2)) | Multi-node DDP (untested), FSDP1, ZeRO, DeepSpeed |
 | `torch.compile`d models, bf16 autocast, fp16 GradScaler, gradient accumulation | Tensor/pipeline parallelism, JAX, whole-step CUDA graphs |
 | One or several optimizers (e.g. Muon + AdamW), LR schedulers | Closure-only optimizers as the starting program |
 | Anything an update can express: algorithm per tensor, per-group and per-block LR, schedules, momentum and betas, preconditioners, clipping inside the optimizer, weight decay | Anything outside the optimizer: model, data, batch size, loss, precision, number of steps |

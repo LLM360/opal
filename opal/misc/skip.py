@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 from .. import programs
 from .nested import devices, restore_devices
+from .sharding import local_data
 
 MAX_SKIPS_IN_A_ROW = 10  # after this many, the next update is applied anyway and the agent is woken
 
@@ -154,7 +155,7 @@ class SkipMixin:
             return
         params, state, devs = before
         for (_, p), w in zip(self.named, params):
-            p.data.copy_(w)
+            local_data(p).copy_(local_data(w))
         with programs.keep_param_group_identity():
             up.load_state_dict(restore_devices(state, devs, self.device))
         for saved in (captured or {}).get("opts", {}).values():

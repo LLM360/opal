@@ -38,7 +38,7 @@ from . import context, defaults, estimate, programs
 from .agent import AgentWorker, Run, new_run_dir, now_stamp
 from .backends import make_backend
 from .backends._privacy import redact_secrets
-from .misc import audit, boundary, integrity, neutral_analysis, waiting
+from .misc import audit, boundary, integrity, neutral_analysis, sharding, waiting
 from .misc.checkpoint import CheckpointMixin
 from .misc.ddp import DDPMixin
 from .misc.precision import PrecisionMixin
@@ -250,6 +250,9 @@ def _plain_json(obj, bad, depth=0):
         bad.append("nesting deeper than 20")
         return str(obj)
     if torch.is_tensor(obj):
+        if sharding.is_dtensor(obj):  # reading it is a collective, and only rank 0 converts the report
+            bad.append("a DTensor (call .full_tensor() in analyze before returning it)")
+            return f"DTensor{tuple(obj.shape)}"
         if obj.numel() == 1:
             return obj.detach().reshape(()).item()
         if obj.numel() <= 10_000:
@@ -439,6 +442,7 @@ class AgentOptimizer(
         self.named = context.named_params(model, self.user_optimizers)
         if not self.named:
             raise ValueError("opal: the optimizer has no parameters of this model")
+        sharding.refuse_fsdp1(model, self.named)
         self._record_dtypes()
         super().__init__([{"params": [p for _, p in self.named], "lr": float("nan")}], {})
         self._own_groups = self.param_groups
@@ -450,6 +454,10 @@ class AgentOptimizer(
         self.world = dist.get_world_size() if self.dist else 1
         self.ctrl = dist.new_group(backend="gloo", timeout=datetime.timedelta(hours=12)) if self.dist else None
         self.rank0 = self.rank == 0
+        # FSDP2 / HSDP: parameters are DTensors, each rank holds shards (misc/sharding.py). analysis.py then runs on
+        # every rank, and the rank check compares each shard only with its replicas (none with pure sharding).
+        self.sharded = sharding.any_sharded(self.named)
+        self._shard_replicas = sharding.has_replicas(self.named, self.world) if self.sharded else True
         self.verbose = verbose and self.rank0
 
         if isinstance(blocking, str) and blocking != "auto":
@@ -556,7 +564,9 @@ class AgentOptimizer(
                 sources=share_code,
             )
             if self._neutral:  # its own starting analysis (misc/neutral_analysis.py)
-                files["analysis.py"] = neutral_analysis.text(self.default_every, self._neutral_epochs)
+                files["analysis.py"] = neutral_analysis.text(
+                    self.default_every, self._neutral_epochs, sharded=self.sharded
+                )
         if self.dist:  # every rank runs rank 0's program text (descriptions of user objects may differ per rank)
             box = [files, str(self.run.dir) if self.rank0 else None]
             dist.broadcast_object_list(box, src=0, group=self.ctrl)
@@ -573,7 +583,7 @@ class AgentOptimizer(
         self._hook_user_optimizers()
         self._watch(activations)
         if self._integrity_on and self.rank0:
-            self._integrity = integrity.Integrity(self.named, self._integrity_threshold)
+            self._integrity = integrity.Integrity(self.named, self._integrity_threshold)  # rank 0's shards if sharded
             self._integrity_record(0)  # the starting parameters
 
         self.worker = None
@@ -685,6 +695,7 @@ class AgentOptimizer(
             user_optimizers=self.user_optimizers,
             user_schedulers=self.user_schedulers,
             clip_grad_norm=None if self._clip_grad_norm is None else float(self._clip_grad_norm),
+            sharded=self.sharded,
         )
 
     def _groups_of(self, updater):
@@ -1046,7 +1057,7 @@ class AgentOptimizer(
             u % self.rank_check_every == 0 or u == self.total
         ):
             self._check_ranks(u)
-        self._capture_next = self.rank0 and bool(self._hooks) and u + 1 >= self._next_analysis
+        self._capture_next = (self.rank0 or self.sharded) and bool(self._hooks) and u + 1 >= self._next_analysis
         if u == self.total:
             self.close()
         return loss
@@ -1168,7 +1179,14 @@ class AgentOptimizer(
             b.synchronize()
             self._set_program_ms(a.elapsed_time(b), v, mu, starting)
             self._events = None
-        if self.rank0:
+        if self.sharded and self.dist:
+            # analysis.py runs on every rank (DTensor reductions are collectives), on rank 0's inputs
+            if self.rank0:
+                self._rank0_record(u, losses, losses_from)
+            wake = self._run_analysis_everywhere(u) if analyze else None
+            if self.rank0:
+                self._rank0_decide(u, wake, new_episode)
+        elif self.rank0:
             self._rank0_check(u, analyze, losses, losses_from, new_episode)
         else:
             self._next_analysis = u + self.every if analyze else self._next_analysis
@@ -1184,6 +1202,12 @@ class AgentOptimizer(
         self._block_now = False
 
     def _rank0_check(self, u, analyze, losses, losses_from, new_episode):
+        self._rank0_record(u, losses, losses_from)
+        wake = self._run_analysis(u) if analyze else None
+        self._rank0_decide(u, wake, new_episode, losses)
+
+    def _rank0_record(self, u, losses, losses_from):
+        """Rank 0 writes the losses, learning rates and metrics since the last check and queues them for the analysis."""
         lrs = []
         for g in self.param_groups:
             try:
@@ -1199,17 +1223,24 @@ class AgentOptimizer(
         self._analysis_metrics.extend(self._plain(m) for m in self._shown_new)  # only values shown to the agent
         self._shown_new = []
         del self._analysis_losses[:-100_000]
-        wake = self._run_analysis(u) if analyze else None
+        self._recorded_losses = losses
+
+    def _rank0_decide(self, u, wake, new_episode, losses=None):
+        """Rank 0, after the analysis: keep the losses for the next decision message, collect the reasons for a
+        decision (non-finite loss, schedule, the analysis' wake request) and submit one."""
+        losses = self._recorded_losses if losses is None else losses
+        self._recorded_losses = []
         self._pending_losses.extend(losses)
         dropped = max(0, len(self._pending_losses) - 100_000)
         self._pending_from += dropped
         self._pending_omitted += dropped
         del self._pending_losses[:-100_000]
         if new_episode:
-            bad = sum(1 for _, p in self.named if not bool(torch.isfinite(p.detach()).all()))
+            bad = sum(1 for _, p in self.named if not bool(torch.isfinite(sharding.local(p.detach())).all()))
+            where = " in rank 0's shards" if self.sharded else ""
             self._reasons.append(
                 f"non-finite training loss before update {u:,} ({bad} of {len(self.named)} parameter tensors are "
-                "non-finite now)"
+                f"non-finite now{where})"
             )
         if self._estimate_due and self._t_mark is not None and u - self._t_mark[0] >= 2:
             self._first_estimate(u)
@@ -1292,10 +1323,36 @@ class AgentOptimizer(
             self.worker.system = self._system_prompt(self._prompt_name, self._names_by_id)
             (self.run.dir / "system.md").write_text(self.worker.system)
 
+    def _run_analysis_everywhere(self, u):
+        """Sharded runs: every rank calls analyze() on the same inputs (rank 0's losses, metrics and timings), so that
+        programs take the same branches and join the same collectives. Rank 0 keeps the report and the wake request;
+        a failure or a change to training on any rank stops the analysis on every rank."""
+        box = [
+            (self._analysis_losses, self._analysis_metrics, self._timing["program_ms"], self._timing["wall_ms_per_update"])
+            if self.rank0
+            else None
+        ]
+        dist.broadcast_object_list(box, src=0, group=self.ctrl)
+        losses, metrics, program_ms, wall_ms = box[0]
+        if not self.rank0:
+            self._analysis_losses, self._analysis_metrics = list(losses), list(metrics)
+            self._timing["program_ms"], self._timing["wall_ms_per_update"] = program_ms, wall_ms
+        off_before = self._analysis_off
+        wake = self._run_analysis(u)
+        failed_here = self._analysis_raised
+        if not self._agree(not failed_here):
+            if not self._analysis_off and not failed_here and self.rank0:
+                self.errors.append(dict(update=u, where="analysis.analyze", error="raised on another rank"))
+            wake = None
+        if not self._agree(self._analysis_off == off_before):  # it changed training on some rank: stop it everywhere
+            self._analysis_off = True
+        return wake if self.rank0 else None
+
     def _run_analysis(self, u):
         """Call the agent's analysis.analyze(obs, memory); keep its report, return its wake request (if any)."""
         self._next_analysis = u + self.every
         wake = None
+        self._analysis_raised = False
         if self.analysis is not None and not self._analysis_off:
             obs = types.SimpleNamespace(
                 update=u,
@@ -1314,6 +1371,7 @@ class AgentOptimizer(
             try:
                 res = self.analysis.analyze(obs, self.memory) or {}
             except programs.AGENT_ERRORS:
+                self._analysis_raised = True
                 self.errors.append(
                     dict(update=u, where="analysis.analyze", error=traceback.format_exc(limit=6)[-3000:])
                 )
@@ -1331,7 +1389,7 @@ class AgentOptimizer(
                         "which it may not do: " + ", ".join(touched[:8]) + (f" ({len(touched)} in all)" if len(touched) > 8 else ""),
                     )
                 )
-            if isinstance(res, dict):
+            if isinstance(res, dict) and self.rank0:  # sharded runs: every rank analyzes, rank 0 reports
                 if "report" in res:
                     bad = []
                     report = _plain_json(res["report"], bad)  # converted now, not when the message is written

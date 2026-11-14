@@ -108,7 +108,8 @@ Trainer: [Try it without an agent](https://github.com/xingjian-bai/opal/blob/mai
 
 ## Prerequisites
 
-- **A PyTorch training script** that uses `torch.optim` optimizers, on CPU, one GPU or several GPUs of one node (DDP).
+- **A PyTorch training script** that uses `torch.optim` optimizers, on CPU, one GPU, several GPUs of one node (DDP),
+  or FSDP2/HSDP on one or several nodes.
   Python 3.10 or newer, PyTorch 2.5 or newer (2.6 on Python 3.13).
 - **For an agent run, Claude Code, logged in on the machine that runs rank 0.** Install
   [Claude Code](https://docs.claude.com/en/docs/claude-code), run `claude` once and log in with a Claude subscription
@@ -204,7 +205,7 @@ Code CLI against a local mock.
 ## Status and limitations
 
 v0.3.10, under active development. Tested on one GPU and on DDP within one node (NCCL, eager and `torch.compile`).
-Multi-node, FSDP and DeepSpeed are not supported. Accelerate works if you wrap after `accelerator.prepare`, without
+FSDP2 and HSDP (DTensor parameters) work on one or several nodes ([Sharded parameters](https://github.com/LLM360/opal/blob/main/docs/GUIDE.md#sharded-parameters-fsdp2)); multi-node DDP is untested; FSDP1 and DeepSpeed are not supported. Accelerate works if you wrap after `accelerator.prepare`, without
 fp16 GradScaler or Accelerate's gradient accumulation; the HF Trainer works through `opal.hf.OpalTrainer`. Both are
 tested on CPU. Lightning should work through `opt.observe(loss)` but we have not tried it. The agent can make a run
 worse: it cannot restart or roll back training, it can only fix its programs at the next decision.

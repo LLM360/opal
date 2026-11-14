@@ -40,6 +40,8 @@ import random
 
 import torch
 
+from .sharding import local
+
 SAMPLE_PER_TENSOR = 1024
 SAMPLE_TOTAL = 32768
 MIN_PER_TENSOR = 32
@@ -81,7 +83,7 @@ def _flat(t):
 class Integrity:
     def __init__(self, named, threshold=5.0, seed=SEED):
         self.names = [n for n, _ in named]
-        self.params = [p for _, p in named]
+        self._owners = [p for _, p in named]  # sharded parameters: the sample is drawn from rank 0's local shards
         self.threshold = float(threshold)
         n = len(self.params)
         per = max(MIN_PER_TENSOR, min(SAMPLE_PER_TENSOR, SAMPLE_TOTAL // max(1, n)))
@@ -110,15 +112,21 @@ class Integrity:
         self.checks = self.flags = 0
         self._ptrs, self._views, self._gather = None, None, {}
 
+    @property
+    def params(self):
+        """The tensors sampled: each parameter, or its local shard (read again each time: p.data may be replaced)."""
+        return [local(p) for p in self._owners]
+
     # ----- every update ---------------------------------------------------------------------------------------
 
     def _build_views(self, ptrs):
         self._ptrs, self._views, self._gather = ptrs, {}, {}
+        params = self.params
         for d, idx in self.groups.items():
             views = []
             for i in idx:
                 off, stride, count = self.spec[i]
-                t = self.params[i].detach()
+                t = params[i].detach()
                 flat = _flat(t)
                 if flat is None:  # not dense: gather these entries at each update (a small copy)
                     flat_idx = torch.arange(off, off + (count - 1) * stride + 1, stride, device=t.device)

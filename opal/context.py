@@ -9,6 +9,8 @@ from pathlib import Path
 
 import torch
 
+from .misc.sharding import describe
+
 _PREFIXES = ("module.", "_orig_mod.", "_fsdp_wrapped_module.")
 
 
@@ -43,7 +45,9 @@ def param_table(named, names_by_group=None) -> str:
     lines = []
     for n, p in named:
         g = f"  group {names_by_group[n]}" if names_by_group and n in names_by_group else ""
-        lines.append(f"  {n} {tuple(p.shape)} {str(p.dtype).replace('torch.', '')}{g}")
+        placed = describe(p)  # sharded parameters: mesh placements and rank 0's local shape
+        placed = f"  {placed}" if placed else ""
+        lines.append(f"  {n} {tuple(p.shape)} {str(p.dtype).replace('torch.', '')}{g}{placed}")
     return "\n".join(lines)
 
 
